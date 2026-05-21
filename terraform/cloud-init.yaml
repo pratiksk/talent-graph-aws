@@ -1,0 +1,596 @@
+#cloud-config
+bootcmd:
+  - mkdir -p /opt/talent-graph
+
+write_files:
+  - path: /opt/talent-graph/requirements.txt
+
+    content: |
+      fastapi>=0.100.0
+      uvicorn[standard]>=0.22.0
+      neo4j>=5.0.0
+      boto3>=1.26.0
+      faker>=18.0.0
+
+  - path: /opt/talent-graph/graph.py
+
+    content: |
+      import os
+      from neo4j import GraphDatabase
+      from neo4j.graph import Node, Relationship
+
+      _driver = None
+
+
+      def init_driver(uri: str, password: str):
+          global _driver
+          _driver = GraphDatabase.driver(uri, auth=("neo4j", password))
+
+
+      def ping() -> bool:
+          try:
+              _driver.verify_connectivity()
+              return True
+          except Exception:
+              return False
+
+
+      def run_query(cypher: str, params: dict = None) -> list:
+          with _driver.session() as session:
+              result = session.run(cypher, params or {})
+              return [_record_to_dict(record) for record in result]
+
+
+      def _record_to_dict(record) -> dict:
+          out = {}
+          for key, val in record.items():
+              if isinstance(val, Node):
+                  out[key] = {"id": val.element_id, "labels": list(val.labels), **dict(val)}
+              elif isinstance(val, Relationship):
+                  out[key] = {
+                      "id": val.element_id,
+                      "type": val.type,
+                      "start": val.start_node.element_id,
+                      "end": val.end_node.element_id,
+                      **dict(val),
+                  }
+              else:
+                  out[key] = val
+          return out
+
+
+      def execute_query(cypher: str, params: dict = None) -> tuple:
+          json_records = []
+          node_ids = set()
+          with _driver.session() as session:
+              result = session.run(cypher, params or {})
+              for record in result:
+                  record_dict = {}
+                  for key, val in record.items():
+                      if isinstance(val, Node):
+                          node_ids.add(val.element_id)
+                          record_dict[key] = {
+                              "id": val.element_id,
+                              "labels": list(val.labels),
+                              **dict(val),
+                          }
+                      elif isinstance(val, Relationship):
+                          node_ids.add(val.start_node.element_id)
+                          node_ids.add(val.end_node.element_id)
+                          record_dict[key] = {
+                              "id": val.element_id,
+                              "type": val.type,
+                              "start": val.start_node.element_id,
+                              "end": val.end_node.element_id,
+                              **dict(val),
+                          }
+                      else:
+                          record_dict[key] = val
+                  json_records.append(record_dict)
+          return json_records, list(node_ids)
+
+
+      def get_all_nodes_and_edges() -> dict:
+          nodes = []
+          edges = []
+          with _driver.session() as session:
+              result = session.run("MATCH (n) RETURN n")
+              for record in result:
+                  node = record["n"]
+                  nodes.append({
+                      "id": node.element_id,
+                      "label": list(node.labels)[0] if node.labels else "Unknown",
+                      "properties": dict(node),
+                  })
+              result = session.run("MATCH ()-[r]->() RETURN r")
+              for record in result:
+                  rel = record["r"]
+                  edges.append({
+                      "id": rel.element_id,
+                      "source": rel.start_node.element_id,
+                      "target": rel.end_node.element_id,
+                      "label": rel.type,
+                  })
+          return {"nodes": nodes, "edges": edges}
+
+
+      def create_constraints():
+          labels = ["Person", "Skill", "Project", "Client", "Team"]
+          with _driver.session() as session:
+              for label in labels:
+                  session.run(
+                      f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.id IS UNIQUE"
+                  )
+
+  - path: /opt/talent-graph/bedrock.py
+
+    content: |
+      import os
+      import re
+      import json
+      import boto3
+
+      BEDROCK_REGION = os.getenv("BEDROCK_REGION", "ap-south-1")
+      LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "apac.anthropic.claude-3-7-sonnet-20250219-v1:0")
+      EMBED_MODEL_ID = os.getenv("EMBED_MODEL_ID", "amazon.titan-embed-text-v2:0")
+
+      _client = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
+
+      SCHEMA_PROMPT = """You are a Cypher query generator for a Neo4j knowledge graph.
+
+      Schema:
+      Nodes:
+        Person(id, name, role, seniority, availability, location)
+        Skill(id, name, category)
+        Project(id, name, status, start_date, end_date, description)
+        Client(id, name, industry, size)
+        Team(id, name, location, lead)
+
+      Relationships:
+        (Person)-[:HAS_SKILL {proficiency, years}]->(Skill)
+        (Person)-[:WORKED_ON {role, from, to}]->(Project)
+        (Person)-[:MEMBER_OF]->(Team)
+        (Project)-[:FOR_CLIENT]->(Client)
+        (Project)-[:USED_SKILL]->(Skill)
+        (Team)-[:DELIVERED]->(Project)
+
+      Rules:
+      - Return ONLY valid Cypher with no explanation, comments, or markdown fences.
+      - Use MATCH and RETURN; avoid WRITE operations.
+      - When filtering by availability, use: WHERE p.availability = true
+      - Skill names are exact (e.g. "AWS", "Kafka", "Python"). Match case-insensitively with toLower().
+      - ALWAYS RETURN full node/relationship variables (e.g., RETURN p, r, sk).
+        NEVER return individual property fields (e.g., NOT p.name, NOT p.role).
+        Returning full nodes is required for graph highlighting to work.
+      - FOLLOW-UP RULE: When the user's question clearly refines or filters a previous result set
+        (uses words like "these", "those", "them", "out of", "among them", "from above", "available"
+        as a drill-down, etc.), generate a SINGLE Cypher query that combines ALL constraints from
+        the prior questions AND the new question. Do NOT start a fresh query -- merge the filters."""
+
+
+      def nl_to_cypher(question: str, history: list = None) -> str:
+          user_msg = question
+          if history:
+              ctx = "\n\n".join(
+                  f"Q: {h.question}\nCypher: {h.cypher}"
+                  for h in history[-3:]
+                  if h.cypher
+              )
+              if ctx:
+                  user_msg = (
+                      f"Conversation history (most recent last):\n{ctx}\n\n"
+                      f"New question: {question}\n\n"
+                      "If this question drills down or filters the previous results, "
+                      "write a single Cypher that merges ALL prior constraints with the new one."
+                  )
+          cypher = _invoke_claude(SCHEMA_PROMPT, [{"role": "user", "content": user_msg}])
+          return re.sub(r"```(?:cypher)?\n?|```", "", cypher).strip()
+
+
+      def answer_from_results(question: str, results: list, history: list = None) -> str:
+          system = (
+              "You are a helpful assistant for an engineering talent management system. "
+              "Answer the question using only the graph data provided. Be concise and clear. "
+              "If the data is empty, say no matching records were found."
+          )
+          messages = []
+          for h in (history or [])[-3:]:
+              messages.append({"role": "user", "content": h.question})
+              messages.append({"role": "assistant", "content": h.answer})
+          messages.append({
+              "role": "user",
+              "content": f"Question: {question}\n\nGraph results:\n{json.dumps(results, default=str, indent=2)}",
+          })
+          return _invoke_claude(system, messages)
+
+
+      def _invoke_claude(system: str, messages: list) -> str:
+          body = json.dumps(
+              {
+                  "anthropic_version": "bedrock-2023-05-31",
+                  "max_tokens": 1024,
+                  "temperature": 0,
+                  "system": system,
+                  "messages": messages,
+              }
+          )
+          response = _client.invoke_model(modelId=LLM_MODEL_ID, body=body)
+          result = json.loads(response["body"].read())
+          return result["content"][0]["text"]
+
+
+      def embed_text(text: str) -> list:
+          body = json.dumps({"inputText": text})
+          response = _client.invoke_model(modelId=EMBED_MODEL_ID, body=body)
+          result = json.loads(response["body"].read())
+          return result["embedding"]
+
+  - path: /opt/talent-graph/ingest.py
+
+    content: |
+      import random
+      from faker import Faker
+      import graph
+
+      fake = Faker()
+
+      SKILLS = [
+          ("Python", "language"), ("Java", "language"), ("Go", "language"),
+          ("TypeScript", "language"), ("Rust", "language"),
+          ("AWS", "platform"), ("Kubernetes", "platform"), ("Docker", "platform"),
+          ("Terraform", "platform"), ("Redis", "platform"),
+          ("Kafka", "platform"), ("PostgreSQL", "platform"), ("MongoDB", "platform"),
+          ("Spark", "platform"), ("GraphQL", "platform"),
+          ("React", "framework"), ("Spring Boot", "framework"), ("FastAPI", "framework"),
+          ("iOS", "framework"),
+          ("Fintech Domain", "domain"), ("Healthcare Domain", "domain"),
+          ("ML Ops", "domain"), ("Data Engineering", "domain"),
+          ("DevOps", "domain"), ("Cybersecurity", "domain"),
+      ]
+
+      CLIENTS = [
+          ("PayEdge", "fintech", "large"), ("LoanStream", "fintech", "medium"),
+          ("HealthBridge", "healthcare", "large"), ("RetailCore", "retail", "large"),
+          ("CloudNine Logistics", "logistics", "medium"), ("DataPulse", "analytics", "small"),
+          ("SecureNet", "cybersecurity", "medium"), ("AutoDrive", "automotive", "large"),
+      ]
+
+      TEAMS = [
+          ("Platform Engineering", "London", "Alice Chen"),
+          ("Data Engineering", "Bangalore", "Raj Patel"),
+          ("Product Engineering", "New York", "Marcus Williams"),
+          ("Infrastructure", "Berlin", "Lena Schmidt"),
+          ("Mobile", "Sydney", "James Liu"),
+          ("Security", "Singapore", "Priya Nair"),
+      ]
+
+      PROJECTS = [
+          ("Payment Gateway V2", "completed", "fintech", "Real-time payment processing with Kafka and AWS"),
+          ("Fraud Detection Platform", "active", "fintech", "ML-based fraud detection for card transactions"),
+          ("Loan Origination System", "active", "fintech", "Digital loan application and approval workflow"),
+          ("HealthRecord API", "completed", "healthcare", "FHIR-compliant patient record API"),
+          ("Claims Automation", "active", "healthcare", "Automated insurance claims processing"),
+          ("Inventory Optimizer", "active", "retail", "Real-time inventory management with ML"),
+          ("Supply Chain Tracker", "completed", "logistics", "End-to-end shipment tracking platform"),
+          ("Analytics Platform", "active", "analytics", "Self-serve analytics on Spark"),
+          ("Identity Platform", "completed", "cybersecurity", "Zero-trust identity and access management"),
+          ("Connected Vehicles API", "active", "automotive", "Real-time telemetry API for connected cars"),
+          ("Data Mesh Framework", "planning", "analytics", "Federated data mesh implementation"),
+          ("API Gateway Migration", "completed", "logistics", "Migration from monolith to microservices"),
+          ("Compliance Dashboard", "active", "fintech", "Regulatory reporting and compliance tracking"),
+          ("Mobile Banking App", "active", "fintech", "Consumer mobile banking application"),
+          ("DevOps Transformation", "completed", "cybersecurity", "CI/CD and platform modernisation"),
+      ]
+
+      PROJECT_SKILLS = {
+          "Payment Gateway V2": ["Kafka", "Java", "AWS", "PostgreSQL"],
+          "Fraud Detection Platform": ["Python", "Kafka", "AWS", "ML Ops"],
+          "Loan Origination System": ["Java", "Spring Boot", "PostgreSQL", "Kubernetes"],
+          "HealthRecord API": ["Python", "FastAPI", "PostgreSQL", "Kubernetes"],
+          "Claims Automation": ["Python", "Spark", "AWS", "ML Ops"],
+          "Inventory Optimizer": ["Python", "Kafka", "Redis", "React"],
+          "Supply Chain Tracker": ["Go", "Kafka", "AWS", "Docker"],
+          "Analytics Platform": ["Python", "Spark", "AWS", "Data Engineering"],
+          "Identity Platform": ["Go", "Kubernetes", "AWS", "Cybersecurity"],
+          "Connected Vehicles API": ["Go", "Kafka", "AWS", "Docker"],
+          "Data Mesh Framework": ["Python", "Spark", "Kafka", "Data Engineering"],
+          "API Gateway Migration": ["Go", "Kubernetes", "Docker", "Terraform"],
+          "Compliance Dashboard": ["Python", "React", "AWS", "Fintech Domain"],
+          "Mobile Banking App": ["React", "TypeScript", "AWS", "Fintech Domain"],
+          "DevOps Transformation": ["Terraform", "Kubernetes", "Docker", "AWS"],
+      }
+
+      TEAM_PROJECTS = {
+          "Platform Engineering": ["Payment Gateway V2", "API Gateway Migration", "Identity Platform"],
+          "Data Engineering": ["Analytics Platform", "Data Mesh Framework", "Fraud Detection Platform"],
+          "Product Engineering": ["Mobile Banking App", "Loan Origination System", "Compliance Dashboard"],
+          "Infrastructure": ["DevOps Transformation", "Identity Platform", "Connected Vehicles API"],
+          "Mobile": ["Mobile Banking App", "Connected Vehicles API"],
+          "Security": ["Identity Platform", "Fraud Detection Platform", "Compliance Dashboard"],
+      }
+
+      DEMO_FINTECH_PROJECTS = [
+          "Payment Gateway V2", "Fraud Detection Platform", "Mobile Banking App",
+          "Compliance Dashboard", "Loan Origination System", "Payment Gateway V2",
+      ]
+
+      ROLES = ["Software Engineer", "Senior Engineer", "Staff Engineer", "Tech Lead", "Principal Engineer"]
+      SENIORITY = ["junior", "mid", "senior", "staff", "principal"]
+      LOCATIONS = ["London", "Bangalore", "New York", "Berlin", "Sydney", "Singapore", "Toronto", "Amsterdam"]
+      PROFICIENCY = ["beginner", "intermediate", "expert"]
+
+
+      def _skill_id(name):
+          return name.lower().replace(" ", "_")
+
+
+      def _node_id(name):
+          return name.lower().replace(" ", "_").replace("-", "_").replace("/", "_")
+
+
+      def run_ingest():
+          graph.run_query("MATCH (n) DETACH DELETE n")
+          graph.create_constraints()
+
+          skill_ids = {}
+          for name, category in SKILLS:
+              sid = _skill_id(name)
+              graph.run_query(
+                  "MERGE (s:Skill {id: $id}) SET s.name = $name, s.category = $category",
+                  {"id": sid, "name": name, "category": category},
+              )
+              skill_ids[name] = sid
+
+          client_ids = {}
+          for name, industry, size in CLIENTS:
+              cid = _node_id(name)
+              graph.run_query(
+                  "MERGE (c:Client {id: $id}) SET c.name = $name, c.industry = $industry, c.size = $size",
+                  {"id": cid, "name": name, "industry": industry, "size": size},
+              )
+              client_ids[name] = cid
+
+          team_ids = {}
+          for name, location, lead in TEAMS:
+              tid = _node_id(name)
+              graph.run_query(
+                  "MERGE (t:Team {id: $id}) SET t.name = $name, t.location = $location, t.lead = $lead",
+                  {"id": tid, "name": name, "location": location, "lead": lead},
+              )
+              team_ids[name] = tid
+
+          project_ids = {}
+          industry_clients = {}
+          for cname, ind, _ in CLIENTS:
+              industry_clients.setdefault(ind, []).append(cname)
+
+          for name, status, industry, description in PROJECTS:
+              pid = _node_id(name)
+              start = fake.date_between(start_date="-3y", end_date="-1y").isoformat()
+              end = fake.date_between(start_date="-1y", end_date="today").isoformat() if status == "completed" else None
+              graph.run_query(
+                  "MERGE (p:Project {id: $id}) SET p.name = $name, p.status = $status, "
+                  "p.start_date = $start, p.end_date = $end, p.description = $desc",
+                  {"id": pid, "name": name, "status": status, "start": start, "end": end, "desc": description},
+              )
+              project_ids[name] = pid
+              clients_for_industry = industry_clients.get(industry) or [CLIENTS[0][0]]
+              graph.run_query(
+                  "MATCH (p:Project {id: $pid}), (c:Client {id: $cid}) MERGE (p)-[:FOR_CLIENT]->(c)",
+                  {"pid": pid, "cid": client_ids[random.choice(clients_for_industry)]},
+              )
+
+          for proj_name, skills in PROJECT_SKILLS.items():
+              for skill in skills:
+                  if skill in skill_ids:
+                      graph.run_query(
+                          "MATCH (p:Project {id: $pid}), (s:Skill {id: $sid}) MERGE (p)-[:USED_SKILL]->(s)",
+                          {"pid": project_ids[proj_name], "sid": skill_ids[skill]},
+                      )
+
+          for team_name, projects in TEAM_PROJECTS.items():
+              for proj_name in projects:
+                  graph.run_query(
+                      "MATCH (t:Team {id: $tid}), (p:Project {id: $pid}) MERGE (t)-[:DELIVERED]->(p)",
+                      {"tid": team_ids[team_name], "pid": project_ids[proj_name]},
+                  )
+
+          team_names = list(team_ids.keys())
+          all_skill_names = list(skill_ids.keys())
+          all_project_names = list(project_ids.keys())
+
+          for i in range(6):
+              pid = f"person_{i}"
+              role = random.choice(["Senior Engineer", "Staff Engineer", "Tech Lead"])
+              graph.run_query(
+                  "MERGE (p:Person {id: $id}) SET p.name = $name, p.role = $role, "
+                  "p.seniority = $sen, p.availability = true, p.location = $loc",
+                  {"id": pid, "name": fake.name(), "role": role,
+                   "sen": random.choice(["senior", "staff"]), "loc": random.choice(LOCATIONS)},
+              )
+              for skill in ["AWS", "Kafka", "Python", "Docker"]:
+                  graph.run_query(
+                      "MATCH (p:Person {id: $pid}), (s:Skill {id: $sid}) "
+                      "MERGE (p)-[:HAS_SKILL {proficiency: $prof, years: $years}]->(s)",
+                      {"pid": pid, "sid": skill_ids[skill],
+                       "prof": "expert" if skill in ("AWS", "Kafka") else "intermediate",
+                       "years": random.randint(3, 8)},
+                  )
+              graph.run_query(
+                  "MATCH (p:Person {id: $pid}), (proj:Project {id: $projid}) "
+                  "MERGE (p)-[:WORKED_ON {role: $role, from: $from, to: $to}]->(proj)",
+                  {"pid": pid, "projid": project_ids[DEMO_FINTECH_PROJECTS[i]], "role": role,
+                   "from": fake.date_between(start_date="-3y", end_date="-1y").isoformat(),
+                   "to": fake.date_between(start_date="-1y", end_date="today").isoformat()},
+              )
+              graph.run_query(
+                  "MATCH (p:Person {id: $pid}), (t:Team {id: $tid}) MERGE (p)-[:MEMBER_OF]->(t)",
+                  {"pid": pid, "tid": team_ids[team_names[i % len(team_names)]]},
+              )
+
+          for i in range(6, 50):
+              pid = f"person_{i}"
+              role = random.choice(ROLES)
+              graph.run_query(
+                  "MERGE (p:Person {id: $id}) SET p.name = $name, p.role = $role, "
+                  "p.seniority = $sen, p.availability = $avail, p.location = $loc",
+                  {"id": pid, "name": fake.name(), "role": role,
+                   "sen": random.choice(SENIORITY), "avail": random.random() > 0.6,
+                   "loc": random.choice(LOCATIONS)},
+              )
+              for skill in random.sample(all_skill_names, random.randint(3, 7)):
+                  graph.run_query(
+                      "MATCH (p:Person {id: $pid}), (s:Skill {id: $sid}) "
+                      "MERGE (p)-[:HAS_SKILL {proficiency: $prof, years: $years}]->(s)",
+                      {"pid": pid, "sid": skill_ids[skill],
+                       "prof": random.choice(PROFICIENCY), "years": random.randint(1, 8)},
+                  )
+              for proj_name in random.sample(all_project_names, random.randint(1, 3)):
+                  graph.run_query(
+                      "MATCH (p:Person {id: $pid}), (proj:Project {id: $projid}) "
+                      "MERGE (p)-[:WORKED_ON {role: $role, from: $from, to: $to}]->(proj)",
+                      {"pid": pid, "projid": project_ids[proj_name], "role": role,
+                       "from": fake.date_between(start_date="-3y", end_date="-1y").isoformat(),
+                       "to": fake.date_between(start_date="-1y", end_date="today").isoformat()},
+                  )
+              graph.run_query(
+                  "MATCH (p:Person {id: $pid}), (t:Team {id: $tid}) MERGE (p)-[:MEMBER_OF]->(t)",
+                  {"pid": pid, "tid": team_ids[random.choice(team_names)]},
+              )
+
+          node_result = graph.run_query("MATCH (n) RETURN count(n) as count")
+          rel_result = graph.run_query("MATCH ()-[r]->() RETURN count(r) as count")
+          return {
+              "nodes": node_result[0]["count"] if node_result else 0,
+              "relationships": rel_result[0]["count"] if rel_result else 0,
+          }
+
+  - path: /opt/talent-graph/main.py
+
+    content: |
+      import os
+      from contextlib import asynccontextmanager
+      from fastapi import FastAPI, HTTPException, APIRouter
+      from fastapi.middleware.cors import CORSMiddleware
+      from pydantic import BaseModel
+      import graph
+      import bedrock
+      import ingest
+
+      NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+      NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "neo4j")
+
+
+      @asynccontextmanager
+      async def lifespan(app: FastAPI):
+          graph.init_driver(NEO4J_URI, NEO4J_PASSWORD)
+          yield
+          if graph._driver:
+              graph._driver.close()
+
+
+      app = FastAPI(title="Talent Graph API", lifespan=lifespan)
+
+      app.add_middleware(
+          CORSMiddleware,
+          allow_origins=["*"],
+          allow_methods=["*"],
+          allow_headers=["*"],
+      )
+
+      router = APIRouter(prefix="/api")
+
+
+      class HistoryItem(BaseModel):
+          question: str
+          answer: str
+          cypher: str
+
+
+      class QueryRequest(BaseModel):
+          question: str
+          history: list[HistoryItem] = []
+
+
+      class QueryResponse(BaseModel):
+          answer: str
+          cypher: str
+          traversed_node_ids: list[str]
+
+
+      @router.get("/health")
+      def health():
+          return {"status": "ok", "neo4j": graph.ping()}
+
+
+      @router.post("/ingest")
+      def ingest_data():
+          return ingest.run_ingest()
+
+
+      @router.get("/graph")
+      def get_graph():
+          return graph.get_all_nodes_and_edges()
+
+
+      @router.post("/query", response_model=QueryResponse)
+      def query(req: QueryRequest):
+          try:
+              cypher = bedrock.nl_to_cypher(req.question, req.history)
+              records, traversed_ids = graph.execute_query(cypher)
+              answer = bedrock.answer_from_results(req.question, records, req.history)
+              return QueryResponse(answer=answer, cypher=cypher, traversed_node_ids=traversed_ids)
+          except Exception as e:
+              raise HTTPException(status_code=500, detail=str(e))
+
+      app.include_router(router)
+
+  - path: /etc/talent-graph.env
+    permissions: '0600'
+    content: |
+      NEO4J_URI=bolt://localhost:7687
+      NEO4J_PASSWORD=${neo4j_password}
+      BEDROCK_REGION=${aws_region}
+      LLM_MODEL_ID=${llm_model_id}
+      EMBED_MODEL_ID=${embed_model_id}
+
+  - path: /etc/systemd/system/talent-graph.service
+    content: |
+      [Unit]
+      Description=Talent Graph API
+      After=network.target neo4j.service
+
+      [Service]
+      Type=simple
+      User=ubuntu
+      WorkingDirectory=/opt/talent-graph
+      EnvironmentFile=/etc/talent-graph.env
+      ExecStart=/usr/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
+      Restart=always
+      RestartSec=10
+      StandardOutput=journal
+      StandardError=journal
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - apt-get update -y
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y openjdk-17-jre-headless python3-pip wget gnupg curl
+  - mkdir -p /etc/apt/keyrings
+  - wget -O - https://debian.neo4j.com/neotechnology.gpg.key | gpg --dearmor -o /etc/apt/keyrings/neotechnology.gpg
+  - echo 'deb [signed-by=/etc/apt/keyrings/neotechnology.gpg] https://debian.neo4j.com stable 5' > /etc/apt/sources.list.d/neo4j.list
+  - apt-get update -y
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y neo4j
+  - neo4j-admin dbms set-initial-password '${neo4j_password}'
+  - echo 'server.bolt.listen_address=0.0.0.0:7687' >> /etc/neo4j/neo4j.conf
+  - echo 'server.http.listen_address=0.0.0.0:7474' >> /etc/neo4j/neo4j.conf
+  - systemctl enable neo4j
+  - systemctl start neo4j
+  - chown -R ubuntu:ubuntu /opt/talent-graph
+  - pip3 install -r /opt/talent-graph/requirements.txt
+  - systemctl daemon-reload
+  - systemctl enable talent-graph
+  - systemctl start talent-graph
+  - until curl -sf http://localhost:8000/api/health | grep -q '"neo4j":true'; do sleep 5; done
+  - curl -sf -X POST http://localhost:8000/api/ingest || true

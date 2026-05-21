@@ -1,0 +1,48 @@
+resource "aws_iam_role" "ec2" {
+  name = "${var.project_name}-ec2-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+
+  tags = local.tags
+}
+
+resource "aws_iam_role_policy" "bedrock" {
+  name = "${var.project_name}-bedrock"
+  role = aws_iam_role.ec2.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeModelWithResponseStream",
+        ]
+        Resource = [
+          "arn:aws:bedrock:*::foundation-model/*",
+          "arn:aws:bedrock:*:*:inference-profile/*",
+        ]
+      },
+      {
+        # Required by Bedrock to verify cross-region inference profile subscriptions
+        Effect   = "Allow"
+        Action   = ["aws-marketplace:ViewSubscriptions"]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_instance_profile" "ec2" {
+  name = "${var.project_name}-ec2-profile"
+  role = aws_iam_role.ec2.name
+  tags = local.tags
+}
