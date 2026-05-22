@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
-import { Search, X, Send, ChevronDown, ChevronUp, Loader2 } from 'lucide-react'
+import { Search, X, Send, ChevronDown, ChevronUp, Loader2, Sun, Moon } from 'lucide-react'
 import KnowledgeGraphView from './KnowledgeGraphView'
 import { fetchGraph, queryGraph } from './api'
 import type { TalentNode, TalentEdge, ChatEntry } from './types'
@@ -48,7 +48,17 @@ function NodeSheet({ node, onClose }: { node: TalentNode; onClose: () => void })
   )
 }
 
+function useDarkMode() {
+  const [dark, setDark] = useState(() => localStorage.getItem('theme') !== 'light')
+  useEffect(() => {
+    document.documentElement.classList.toggle('light', !dark)
+    localStorage.setItem('theme', dark ? 'dark' : 'light')
+  }, [dark])
+  return [dark, setDark] as const
+}
+
 export default function App() {
+  const [dark, setDark] = useDarkMode()
   const [nodes, setNodes] = useState<TalentNode[]>([])
   const [edges, setEdges] = useState<TalentEdge[]>([])
   const [loading, setLoading] = useState(true)
@@ -116,9 +126,19 @@ export default function App() {
       <nav className="flex items-center gap-3 px-5 flex-shrink-0" style={{ height: 52, background: 'hsl(var(--popover))', borderBottom: '1px solid hsl(var(--border))' }}>
         <span className="text-base font-bold" style={{ color: 'hsl(var(--accent))' }}>Talent Graph</span>
         <span className="text-xs text-muted-foreground">Engineering Resource Knowledge Graph</span>
-        {!loading && !loadError && (
-          <span className="ml-auto text-xs text-muted-foreground">{nodes.length} nodes · {edges.length} edges</span>
-        )}
+        <div className="ml-auto flex items-center gap-3">
+          {!loading && !loadError && (
+            <span className="text-xs text-muted-foreground">{nodes.length} nodes · {edges.length} edges</span>
+          )}
+          <button
+            onClick={() => setDark(d => !d)}
+            className="p-1.5 rounded-md text-muted-foreground hover:text-foreground transition-colors"
+            style={{ border: '1px solid hsl(var(--border))' }}
+            title={dark ? 'Switch to light mode' : 'Switch to dark mode'}
+          >
+            {dark ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
+          </button>
+        </div>
       </nav>
 
       <div className="flex flex-1 overflow-hidden">

@@ -81,6 +81,21 @@ resource "aws_s3_object" "index_html" {
   }))
 }
 
+resource "aws_cloudfront_vpc_origin" "api" {
+  vpc_origin_endpoint_config {
+    name                   = "${var.project_name}-api"
+    arn                    = aws_instance.api.arn
+    http_port              = 8000
+    https_port             = 443
+    origin_protocol_policy = "http-only"
+
+    origin_ssl_protocols {
+      items    = ["TLSv1.2"]
+      quantity = 1
+    }
+  }
+}
+
 resource "aws_cloudfront_distribution" "frontend" {
   enabled             = true
   default_root_object = "index.html"
@@ -99,19 +114,12 @@ resource "aws_cloudfront_distribution" "frontend" {
     }
   }
 
-  # CloudFront proxies /api/* to EC2 over HTTP so the browser only ever sees HTTPS.
-  # The EC2 API has no TLS cert (bare IP, no domain) so direct calls from the HTTPS
-  # frontend would be blocked as mixed-content. In production you would terminate TLS
-  # at an ALB with an ACM certificate instead.
   origin {
     origin_id   = "ec2-api"
-    domain_name = aws_instance.api.public_dns  # public_dns required; CloudFront rejects bare IPs
+    domain_name = aws_instance.api.private_dns
 
-    custom_origin_config {
-      http_port                = 8000
-      https_port               = 443
-      origin_protocol_policy   = "http-only"
-      origin_ssl_protocols     = ["TLSv1.2"]
+    vpc_origin_config {
+      vpc_origin_id            = aws_cloudfront_vpc_origin.api.id
       origin_read_timeout      = 60
       origin_keepalive_timeout = 60
     }

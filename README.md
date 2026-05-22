@@ -57,18 +57,19 @@ Returns 6+ engineers with expert-level Kafka + AWS skills who worked on fintech 
 
 ```
 Browser → CloudFront → S3 (React SPA)
-                 ↓ /api/* proxy
+                 ↓ /api/* proxy (VPC Origin — private network)
          EC2:8000 (FastAPI)
                ↓          ↓
            Neo4j:7687   Bedrock (Claude + Titan)
 ```
 
+CloudFront reaches EC2 via a [VPC Origin](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-vpc-origins.html) — traffic stays on AWS private networking and never traverses the internet. Port 8000 on the EC2 security group allows only the `CloudFront-VPCOrigins-Service-SG` managed security group (a CIDR rule covering the VPC is insufficient — VPC Origin traffic is filtered at the hypervisor and requires an explicit SG-to-SG rule); the API is not reachable directly from the internet.
+
 > **Demo simplification:** FastAPI and Neo4j run on the same EC2 instance to keep the
 > Terraform footprint minimal. In production you would run Neo4j on a dedicated instance
-> or use [Neo4j AuraDB](https://neo4j.com/cloud/platform/aura-graph-database/), put the
-> API on ECS or a separate EC2 behind an ALB, and have them communicate over a private
-> subnet. The ALB would also provide proper HTTPS termination (ACM certificate) instead
-> of the CloudFront-proxy approach used here.
+> or use [Neo4j AuraDB](https://neo4j.com/cloud/platform/aura-graph-database/), and put
+> the API on ECS or a separate EC2 in a private subnet with CloudFront VPC Origin as the
+> sole ingress path.
 
 Query flow (`POST /query`):
 1. Claude converts natural-language → Cypher
