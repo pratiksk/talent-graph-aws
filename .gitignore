@@ -20,8 +20,3 @@ frontend/dist/
 spec.md
 KG_FRONTEND.md
 .claude/
-
-# Source files from other projects (reference only)
-KnowledgeGraph.tsx
-KnowledgeGraphView.tsx
-package.json
