@@ -4,6 +4,8 @@ A knowledge graph for engineering resource management. Ask natural-language ques
 
 **Stack:** Neo4j + FastAPI on EC2 · Amazon Bedrock (Claude Sonnet + Titan Embeddings) · React + react-force-graph-2d · S3 + CloudFront · Terraform
 
+**Blog post:** [Engineering Resource Management with a Knowledge Graph on AWS](https://www.thinkxl.in/blog/engineering-resource-management-knowledge-graph-aws)
+
 ---
 
 ## Quick start
